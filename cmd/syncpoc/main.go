@@ -21,6 +21,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -64,6 +65,7 @@ func run(args []string) error {
 			return err
 		}
 		defer ln.Close()
+		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
 		return serveLoop(ctx, ln)
 	case "dial":
 		if len(args) != 2 {
@@ -89,6 +91,7 @@ func run(args []string) error {
 		}
 		defer srv.Close()
 		defer ln.Close()
+		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
 		return serveLoop(ctx, ln)
 	case "dial-tailcat":
 		if len(args) != 3 {
@@ -165,6 +168,17 @@ func dialTailcat(ctx context.Context, tcAddr string, port uint16) (net.Conn, err
 	return conn, nil
 }
 
+// closeOnDone closes c once ctx is cancelled so that a blocking Accept or
+// Read unblocks and the program exits promptly on Ctrl+C. Closing twice is
+// safe: the redundant error is ignored.
+func closeOnDone(ctx context.Context, c io.Closer) {
+	go func() {
+		<-ctx.Done()
+		fmt.Fprintln(os.Stderr, "\ninterrupted, closing...")
+		_ = c.Close()
+	}()
+}
+
 // serveLoop accepts connections until interrupted, running the sync
 // exchange on each one.
 func serveLoop(ctx context.Context, ln net.Listener) error {
@@ -188,6 +202,7 @@ func serveLoop(ctx context.Context, ln net.Listener) error {
 func runPeer(ctx context.Context, conn net.Conn, role string) {
 	defer conn.Close()
 	fmt.Printf("[%s] connected: local=%s remote=%s\n", role, conn.LocalAddr(), conn.RemoteAddr())
+	closeOnDone(ctx, conn) // Ctrl+C unblocks the Scan loop below.
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -212,6 +227,10 @@ func runPeer(ctx context.Context, conn net.Conn, role string) {
 		fmt.Printf("[%s] recv type=%s pos=%.1fs latency=%dms\n", role, m.Type, m.PositionSeconds, latency)
 	}
 	if err := sc.Err(); err != nil {
+		if ctx.Err() != nil {
+			fmt.Printf("[%s] stopped\n", role)
+			return
+		}
 		fmt.Printf("[%s] stream ended with error: %v\n", role, err)
 		return
 	}
