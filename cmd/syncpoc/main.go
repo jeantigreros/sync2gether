@@ -1,18 +1,16 @@
-// Command syncpoc is a minimal proof-of-concept for synchronizing
-// playback between two PCs. Both sides send a heartbeat about once
-// per second (see internal/syncmsg) and log each received message
-// with its apparent latency from SentAtUnixMilli.
+// Command syncpoc synchronizes video playback between two PCs. Each side
+// spawns its own mpv and bridges it: anything you do in mpv
+// (play/pause/seek) is broadcast to the peer, and remote events are applied
+// to your mpv. Both sides send a heartbeat about once per second
+// (see internal/syncmsg).
 //
 // Usage:
 //
-//	syncpoc serve <addr> [--mpv-socket PATH]
-//	syncpoc dial <addr> [--mpv-socket PATH]
-//	syncpoc serve-tailcat <port> [--mpv-socket PATH]
-//	syncpoc dial-tailcat <tc-addr> <port> [--mpv-socket PATH]
+//	syncpoc FILE             play FILE locally (no sync)
+//	syncpoc host FILE        play FILE and wait for a peer (prints an address)
+//	syncpoc join <addr> FILE play FILE and join the host at <addr>
 //
-// The plain-TCP modes exercise framing/heartbeat logic offline. The
-// tailcat modes are the real P2P transport (serve prints an address
-// that dial consumes). Playback is driven from stdin, on either side:
+// Playback can also be driven from stdin, on either side:
 //
 //	play        resume from the current position
 //	pause       freeze at the current position
@@ -20,17 +18,8 @@
 //	status      print local playback state
 //	quit        hang up (Ctrl+C and Ctrl+D do the same)
 //
-// With the optional trailing pair "--mpv-socket PATH" (all four modes),
-// syncpoc also bridges a local mpv (--input-ipc-server=PATH): anything you
-// do in mpv (play/pause/seek) is broadcast to the peer through the same
-// hub stdin uses, and remote play/pause/seek events are applied to your
-// mpv. Heartbeats stay mirror-only (logged, never applied to mpv).
-// Without the flag, playback is driven from stdin as before.
-//
-// The message layer (runPeer) is
-// transport-agnostic: switching fully to tailcat only means calling
-// listenTailcat/dialTailcat (the marked swap points) instead of
-// listenPlain/dialPlain.
+// The message layer (runPeer) is transport-agnostic: the host serves a
+// tailcat P2P tunnel (see listenTailcat) that the join side dials.
 package main
 
 import (
@@ -40,7 +29,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,137 +52,104 @@ func main() {
 
 func usage() error {
 	return fmt.Errorf("usage:\n" +
-		"  syncpoc serve <addr> [--mpv-socket PATH]\n" +
-		"  syncpoc dial <addr> [--mpv-socket PATH]\n" +
-		"  syncpoc serve-tailcat <port> [--mpv-socket PATH]\n" +
-		"  syncpoc dial-tailcat <tc-addr> <port> [--mpv-socket PATH]")
+		"  syncpoc FILE [--port N]\n" +
+		"  syncpoc host FILE [--port N]\n" +
+		"  syncpoc join <tailcat-address> FILE [--port N]\n" +
+		"defaults: --port 8080")
 }
 
-// splitMpvSocket strips the optional trailing "--mpv-socket PATH" pair
-// from the mode arguments. The flag is only accepted as the final pair;
-// anywhere else it is a usage error rather than a silently ignored flag.
-func splitMpvSocket(args []string) ([]string, string, error) {
+// defaultPort is the tailcat TCP port both sides use when --port is absent.
+const defaultPort = 8080
+
+// splitPort strips the optional trailing "--port N" pair from the arguments.
+// The flag is only accepted as the final pair; N must be a valid TCP port.
+func splitPort(args []string) ([]string, uint16, error) {
 	for i, a := range args {
-		if a == "--mpv-socket" {
+		if a == "--port" {
 			if i != len(args)-2 {
-				return nil, "", fmt.Errorf("--mpv-socket PATH must be the final pair")
+				return nil, 0, fmt.Errorf("--port N must be the final pair")
 			}
-			return args[:i], args[i+1], nil
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n < 1 || n > 65535 {
+				return nil, 0, fmt.Errorf("invalid port %q", args[i+1])
+			}
+			return args[:i], uint16(n), nil
 		}
 	}
-	return args, "", nil
+	return args, defaultPort, nil
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
 		return usage()
 	}
-	args, mpvSock, err := splitMpvSocket(args)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	args, port, err := splitPort(args)
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
 		return usage()
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	hub := &cmdHub{}
-	go readStdin(hub, stop)
-
-	var mc *mpv.Client
-	if mpvSock != "" {
-		mc, err = mpv.Dial(mpvSock)
-		if err != nil {
-			return err
-		}
-		defer mc.Close()
-		fmt.Println("mpv bridge: observing", mpvSock)
-		if err := watchMpv(ctx, mc, hub); err != nil {
-			return err
-		}
-	}
 
 	switch args[0] {
-	case "serve":
+	case "host":
 		if len(args) != 2 {
 			return usage()
 		}
-		printHelp()
-		ln, err := listenPlain(args[1]) // TAILCAT SWAP POINT: use listenTailcat for P2P.
-		if err != nil {
-			return err
-		}
-		defer ln.Close()
-		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
-		return serveLoop(ctx, ln, hub, mc)
-	case "dial":
-		if len(args) != 2 {
-			return usage()
-		}
-		printHelp()
-		conn, err := dialPlain(ctx, args[1]) // TAILCAT SWAP POINT: use dialTailcat for P2P.
-		if err != nil {
-			return err
-		}
-		runPeer(ctx, conn, "dial", hub, mc)
-		return nil
-	case "serve-tailcat":
-		if len(args) != 2 {
-			return usage()
-		}
-		printHelp()
-		port, err := parsePort(args[1])
-		if err != nil {
-			return err
-		}
-		srv, ln, err := listenTailcat(ctx, port)
-		if err != nil {
-			return err
-		}
-		defer srv.Close()
-		defer ln.Close()
-		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
-		return serveLoop(ctx, ln, hub, mc)
-	case "dial-tailcat":
+
+		return runHost(ctx, stop, args[1], port)
+
+	case "join":
 		if len(args) != 3 {
 			return usage()
 		}
-		printHelp()
-		port, err := parsePort(args[2])
-		if err != nil {
-			return err
-		}
-		conn, err := dialTailcat(ctx, args[1], port)
-		if err != nil {
-			return err
-		}
-		runPeer(ctx, conn, "dial", hub, mc)
-		return nil
+
+		return runJoin(ctx, stop, args[1], args[2], port)
+
 	default:
-		return usage()
+		// No subcommand: treat the argument as a local video file.
+		if len(args) != 1 {
+			return usage()
+		}
+
+		return runLocal(ctx, args[0])
 	}
 }
 
-// listenPlain opens a plain TCP listener. Offline-friendly; this is the
-// tailcat swap point on the serving side (see listenTailcat).
-func listenPlain(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
+func runLocal(ctx context.Context, file string) error {
+	cmd, socket, err := startMpv(ctx, file)
 	if err != nil {
-		return nil, fmt.Errorf("listen %s: %w", addr, err)
+		return err
 	}
-	fmt.Println("listening on", ln.Addr())
-	return ln, nil
-}
 
-// dialPlain connects over plain TCP. Offline-friendly; this is the
-// tailcat swap point on the dialing side (see dialTailcat).
-func dialPlain(ctx context.Context, addr string) (net.Conn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	fmt.Println("starting mpv:", file)
+
+	mc, err := waitForMpv(ctx, socket)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return err
 	}
-	return conn, nil
+	defer mc.Close()
+
+	fmt.Println("playing:", file)
+
+	// Wait until mpv exits or Ctrl+C cancels the context.
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("mpv: %w", err)
+	}
+
+	return nil
 }
 
 // listenTailcat starts a tailcat server and listens for P2P TCP streams
@@ -228,6 +186,96 @@ func dialTailcat(ctx context.Context, tcAddr string, port uint16) (net.Conn, err
 	return conn, nil
 }
 
+func runHost(
+	ctx context.Context,
+	stop context.CancelFunc,
+	file string,
+	port uint16,
+) error {
+	hub := &cmdHub{}
+	go readStdin(hub, stop)
+
+	mpvCmd, socket, err := startMpv(ctx, file)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_ = mpvCmd.Process.Kill()
+		_ = mpvCmd.Wait()
+	}()
+
+	mc, err := waitForMpv(ctx, socket)
+	if err != nil {
+		return err
+	}
+	defer mc.Close()
+
+	fmt.Println("mpv:", file)
+
+	if err := watchMpv(ctx, mc, hub); err != nil {
+		return err
+	}
+
+	printHelp()
+
+	srv, ln, err := listenTailcat(ctx, port)
+	if err != nil {
+		return err
+	}
+
+	defer srv.Close()
+	defer ln.Close()
+
+	closeOnDone(ctx, ln)
+
+	return serveLoop(ctx, ln, hub, mc)
+}
+
+func runJoin(
+	ctx context.Context,
+	stop context.CancelFunc,
+	tcAddr string,
+	file string,
+	port uint16,
+) error {
+	hub := &cmdHub{}
+	go readStdin(hub, stop)
+
+	mpvCmd, socket, err := startMpv(ctx, file)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_ = mpvCmd.Process.Kill()
+		_ = mpvCmd.Wait()
+	}()
+
+	mc, err := waitForMpv(ctx, socket)
+	if err != nil {
+		return err
+	}
+	defer mc.Close()
+
+	fmt.Println("mpv:", file)
+
+	if err := watchMpv(ctx, mc, hub); err != nil {
+		return err
+	}
+
+	printHelp()
+
+	conn, err := dialTailcat(ctx, tcAddr, port)
+	if err != nil {
+		return err
+	}
+
+	runPeer(ctx, conn, "join", hub, mc)
+
+	return nil
+}
+
 // closeOnDone closes c once ctx is cancelled so that a blocking Accept or
 // Read unblocks and the program exits promptly on Ctrl+C. Closing twice is
 // safe: the redundant error is ignored.
@@ -253,6 +301,58 @@ func serveLoop(ctx context.Context, ln net.Listener, hub *cmdHub, mc *mpv.Client
 			}
 		}
 		go runPeer(ctx, conn, "serve", hub, mc)
+	}
+}
+
+// startMpv use mpv to play the FILE
+
+func startMpv(ctx context.Context, file string) (*exec.Cmd, string, error) {
+	sock := filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf("syncpoc-%d.sock", os.Getpid()),
+	)
+
+	cmd := exec.CommandContext(ctx, "mpv",
+		"--input-ipc-server="+sock,
+		"--force-window=yes",
+		file,
+	)
+
+	if err := cmd.Start(); err != nil {
+		return nil, "", fmt.Errorf("start mpv: %w", err)
+	}
+
+	return cmd, sock, nil
+}
+
+// wait for Mpv since IPC socket might not exist immediately
+func waitForMpv(ctx context.Context, socket string) (*mpv.Client, error) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+
+		case <-timeout.C:
+			return nil, fmt.Errorf("timeout waiting for mpv IPC socket %s", socket)
+
+		case <-ticker.C:
+			if _, err := os.Stat(socket); err != nil {
+				continue
+			}
+
+			mc, err := mpv.Dial(socket)
+			if err != nil {
+				continue
+			}
+
+			return mc, nil
+		}
 	}
 }
 
@@ -434,7 +534,7 @@ func readStdin(hub *cmdHub, stop context.CancelFunc) {
 }
 
 // sendLoop owns this peer's local playback state and is the only writer to
-// conn: a 1s ticker emits heartbeats while stdin commands arrive as events.
+// conn: a 1s ticker emits heartbeats while stdin/mpv commands arrive as events.
 // The position is clock-based (elapsed wall time while playing), so pause
 // freezes it without drift and commands landing between ticks stay accurate.
 func sendLoop(ctx context.Context, conn net.Conn, role string, cmds <-chan peerCmd) {
@@ -507,12 +607,4 @@ func sendLoop(ctx context.Context, conn net.Conn, role string, cmds <-chan peerC
 			}
 		}
 	}
-}
-
-func parsePort(s string) (uint16, error) {
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 1 || n > 65535 {
-		return 0, fmt.Errorf("invalid port %q", s)
-	}
-	return uint16(n), nil
 }

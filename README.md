@@ -24,63 +24,45 @@ This produces no installed binary; run from source or
 
 ## Usage
 
-One side serves, the other dials. Both sides are symmetric afterwards:
+Each side spawns its own mpv and bridges it. One side hosts, the other
+joins with the printed address. Both sides are symmetric afterwards:
 either one can drive playback.
-
-### Keyboard mode (no player)
-
-```bash
-# PC1
-syncpoc serve 0.0.0.0:4433
-# PC2
-syncpoc dial <pc1-ip>:4433
-```
-
-Type commands on either side (stdin):
-
-```
-play        resume from the current position
-pause       freeze at the current position
-seek <secs> jump (keeps playing/paused state)
-status      print local playback state
-quit        hang up (Ctrl+C and Ctrl+D do the same)
-```
-
-A 1 Hz heartbeat carries the position each way; every received message is
-logged with its apparent latency.
-
-### Player mode (mpv follows mpv)
 
 ```bash
 # PC1 (same video file on both machines)
-mpv --input-ipc-server=/tmp/mpv.sock movie.mp4
-syncpoc serve 0.0.0.0:4433 --mpv-socket /tmp/mpv.sock
-
-# PC2
-mpv --input-ipc-server=/tmp/mpv.sock movie.mp4
-syncpoc dial <pc1-ip>:4433 --mpv-socket /tmp/mpv.sock
-```
-
-Anything you do in mpv (play/pause/seek) is broadcast; remote events are
-applied to your mpv. Echo suppression keeps applied commands from bouncing
-back. Heartbeats are mirror-only (logged, never applied to mpv).
-
-### P2P mode (tailcat, no LAN needed)
-
-Same as above but over an end-to-end encrypted P2P tunnel instead of raw
-TCP. The server prints a one-time address you share out of band:
-
-```bash
-# PC1
-syncpoc serve-tailcat 4433 [--mpv-socket /tmp/mpv.sock]
+syncpoc host movie.mp4 [--port N]
 # prints: tailcat address (share with peer): <addr>
 
 # PC2
-syncpoc dial-tailcat <addr> 4433 [--mpv-socket /tmp/mpv.sock]
+syncpoc join <addr> movie.mp4 [--port N]
+```
+Both sides must use the same port (default 8080).
+
+Anything you do in mpv (play/pause/seek) is broadcast to the peer; remote
+events are applied to your mpv. A 1 Hz heartbeat carries the position each
+way, and every received message is logged with its apparent latency.
+
+`syncpoc movie.mp4` alone just plays locally, without sync.
+
+## Shell completion
+
+TAB-completion for subcommands, file arguments and `--port` lives in
+`completions/` (bash, zsh, fish):
+
+```bash
+# bash, this shell only (or append to ~/.bashrc)
+source completions/syncpoc.bash
+# zsh: cp completions/syncpoc.zsh ~/.zsh/completions/_syncpoc  ($fpath)
+# fish: cp completions/syncpoc.fish ~/.config/fish/completions/
 ```
 
-Direct UDP when NAT traversal succeeds, DERP relay as fallback. Expect
-~1–5 ms direct, ~20–80 ms relayed.
+The scripts complete the `syncpoc` name. If you run the binary as
+`./main`, either rename it (`go build -o syncpoc ./cmd/syncpoc`) or, in
+bash, register it too: `complete -F _syncpoc ./main`.
+
+Playback can also be driven from the terminal on either side:
+`play`, `pause`, `seek <secs>`, `status`, `quit`
+(`Ctrl+C` and `Ctrl+D` stop too).
 
 ## Protocol
 
@@ -107,7 +89,8 @@ odd/                local working docs, never committed (see .gitignore)
 
 - `third_party/tailcat` is a reference clone. The real dependency comes
   from the module proxy (`github.com/tailscale/tailcat v0.7.0` in `go.mod`).
-- If both PCs already share a Tailscale tailnet, plain `serve`/`dial` over
-  tailnet IPs is the simplest option; tailcat is for when they don't.
+- Transport is always the tailcat P2P tunnel: direct UDP when NAT
+  traversal succeeds, DERP relay as fallback. Expect ~1–5 ms direct,
+  ~20–80 ms relayed.
 - Conflicts (both sides act at once) resolve last-writer-wins by sender
   timestamp. Good enough for two people watching a movie.
