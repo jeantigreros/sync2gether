@@ -5,10 +5,10 @@
 //
 // Usage:
 //
-//	syncpoc serve <addr>                  listen on plain TCP (offline default)
-//	syncpoc dial <addr>                   connect over plain TCP
-//	syncpoc serve-tailcat <port>          listen over tailcat (P2P WireGuard + DERP)
-//	syncpoc dial-tailcat <tc-addr> <port> connect over tailcat
+//	syncpoc serve <addr> [--mpv-socket PATH]
+//	syncpoc dial <addr> [--mpv-socket PATH]
+//	syncpoc serve-tailcat <port> [--mpv-socket PATH]
+//	syncpoc dial-tailcat <tc-addr> <port> [--mpv-socket PATH]
 //
 // The plain-TCP modes exercise framing/heartbeat logic offline. The
 // tailcat modes are the real P2P transport (serve prints an address
@@ -19,6 +19,13 @@
 //	seek <secs> jump (preserves playing/paused state)
 //	status      print local playback state
 //	quit        hang up (Ctrl+C and Ctrl+D do the same)
+//
+// With the optional trailing pair "--mpv-socket PATH" (all four modes),
+// syncpoc also bridges a local mpv (--input-ipc-server=PATH): anything you
+// do in mpv (play/pause/seek) is broadcast to the peer through the same
+// hub stdin uses, and remote play/pause/seek events are applied to your
+// mpv. Heartbeats stay mirror-only (logged, never applied to mpv).
+// Without the flag, playback is driven from stdin as before.
 //
 // The message layer (runPeer) is
 // transport-agnostic: switching fully to tailcat only means calling
@@ -41,6 +48,7 @@ import (
 
 	"github.com/tailscale/tailcat"
 
+	"sync2gether/internal/mpv"
 	"sync2gether/internal/syncmsg"
 )
 
@@ -53,13 +61,35 @@ func main() {
 
 func usage() error {
 	return fmt.Errorf("usage:\n" +
-		"  syncpoc serve <addr>\n" +
-		"  syncpoc dial <addr>\n" +
-		"  syncpoc serve-tailcat <port>\n" +
-		"  syncpoc dial-tailcat <tc-addr> <port>")
+		"  syncpoc serve <addr> [--mpv-socket PATH]\n" +
+		"  syncpoc dial <addr> [--mpv-socket PATH]\n" +
+		"  syncpoc serve-tailcat <port> [--mpv-socket PATH]\n" +
+		"  syncpoc dial-tailcat <tc-addr> <port> [--mpv-socket PATH]")
+}
+
+// splitMpvSocket strips the optional trailing "--mpv-socket PATH" pair
+// from the mode arguments. The flag is only accepted as the final pair;
+// anywhere else it is a usage error rather than a silently ignored flag.
+func splitMpvSocket(args []string) ([]string, string, error) {
+	for i, a := range args {
+		if a == "--mpv-socket" {
+			if i != len(args)-2 {
+				return nil, "", fmt.Errorf("--mpv-socket PATH must be the final pair")
+			}
+			return args[:i], args[i+1], nil
+		}
+	}
+	return args, "", nil
 }
 
 func run(args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	args, mpvSock, err := splitMpvSocket(args)
+	if err != nil {
+		return err
+	}
 	if len(args) == 0 {
 		return usage()
 	}
@@ -67,6 +97,19 @@ func run(args []string) error {
 	defer stop()
 	hub := &cmdHub{}
 	go readStdin(hub, stop)
+
+	var mc *mpv.Client
+	if mpvSock != "" {
+		mc, err = mpv.Dial(mpvSock)
+		if err != nil {
+			return err
+		}
+		defer mc.Close()
+		fmt.Println("mpv bridge: observing", mpvSock)
+		if err := watchMpv(ctx, mc, hub); err != nil {
+			return err
+		}
+	}
 
 	switch args[0] {
 	case "serve":
@@ -80,7 +123,7 @@ func run(args []string) error {
 		}
 		defer ln.Close()
 		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
-		return serveLoop(ctx, ln, hub)
+		return serveLoop(ctx, ln, hub, mc)
 	case "dial":
 		if len(args) != 2 {
 			return usage()
@@ -90,7 +133,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		runPeer(ctx, conn, "dial", hub)
+		runPeer(ctx, conn, "dial", hub, mc)
 		return nil
 	case "serve-tailcat":
 		if len(args) != 2 {
@@ -108,7 +151,7 @@ func run(args []string) error {
 		defer srv.Close()
 		defer ln.Close()
 		closeOnDone(ctx, ln) // Ctrl+C unblocks Accept.
-		return serveLoop(ctx, ln, hub)
+		return serveLoop(ctx, ln, hub, mc)
 	case "dial-tailcat":
 		if len(args) != 3 {
 			return usage()
@@ -122,7 +165,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		runPeer(ctx, conn, "dial", hub)
+		runPeer(ctx, conn, "dial", hub, mc)
 		return nil
 	default:
 		return usage()
@@ -198,7 +241,7 @@ func closeOnDone(ctx context.Context, c io.Closer) {
 
 // serveLoop accepts connections until interrupted, running the sync
 // exchange on each one.
-func serveLoop(ctx context.Context, ln net.Listener, hub *cmdHub) error {
+func serveLoop(ctx context.Context, ln net.Listener, hub *cmdHub, mc *mpv.Client) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -209,15 +252,45 @@ func serveLoop(ctx context.Context, ln net.Listener, hub *cmdHub) error {
 				return fmt.Errorf("accept: %w", err)
 			}
 		}
-		go runPeer(ctx, conn, "serve", hub)
+		go runPeer(ctx, conn, "serve", hub, mc)
+	}
+}
+
+// watchMpv forwards mpv property observations into the shared hub, so mpv
+// and stdin drive the same sendLoop. Positions from mpv are authoritative
+// (see sendLoop): the local clock resyncs to them instead of drifting.
+func watchMpv(ctx context.Context, mc *mpv.Client, hub *cmdHub) error {
+	cmds, err := mc.Observe(ctx)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for c := range cmds {
+			hub.broadcast(peerCmd{name: c.Name, pos: c.Pos, fromMpv: true})
+		}
+	}()
+	return nil
+}
+
+// applyMpv renders a remote event on the local mpv when the bridge is on.
+// A nil client is a no-op. Failures are logged, never fatal: the sync
+// stream outlives a wedged player.
+func applyMpv(mc *mpv.Client, role string, cmd mpv.Cmd) {
+	if mc == nil {
+		return
+	}
+	if err := mc.Apply(cmd); err != nil {
+		fmt.Printf("[%s] mpv apply %s %.1fs failed: %v\n", role, cmd.Name, cmd.Pos, err)
 	}
 }
 
 // runPeer runs the sync exchange on conn: a sendLoop owns the local playback
-// state and writes heartbeats plus stdin-driven events, while this loop reads
-// and keeps a mirror of the remote playback state. Both sides run the same
-// symmetric logic, so either side can drive playback.
-func runPeer(ctx context.Context, conn net.Conn, role string, hub *cmdHub) {
+// state and writes heartbeats plus stdin/mpv-driven events, while this loop
+// reads and keeps a mirror of the remote playback state. Both sides run the
+// same symmetric logic, so either side can drive playback. When the mpv
+// bridge is on, remote play/pause/seek events are also applied to the local
+// mpv; heartbeats stay mirror-only (logged, never applied).
+func runPeer(ctx context.Context, conn net.Conn, role string, hub *cmdHub, mc *mpv.Client) {
 	defer conn.Close()
 	fmt.Printf("[%s] connected: local=%s remote=%s\n", role, conn.LocalAddr(), conn.RemoteAddr())
 	closeOnDone(ctx, conn) // Ctrl+C unblocks the Scan loop below.
@@ -236,12 +309,15 @@ func runPeer(ctx context.Context, conn net.Conn, role string, hub *cmdHub) {
 		case syncmsg.TypePlay:
 			rPlaying, rPos = true, m.PositionSeconds
 			fmt.Printf("[%s] remote event: play from %.1fs (latency=%dms)\n", role, rPos, latency)
+			applyMpv(mc, role, mpv.Cmd{Name: mpv.CmdPlay, Pos: m.PositionSeconds})
 		case syncmsg.TypePause:
 			rPlaying, rPos = false, m.PositionSeconds
 			fmt.Printf("[%s] remote event: pause at %.1fs (latency=%dms)\n", role, rPos, latency)
+			applyMpv(mc, role, mpv.Cmd{Name: mpv.CmdPause, Pos: m.PositionSeconds})
 		case syncmsg.TypeSeek:
 			rPos = m.PositionSeconds
 			fmt.Printf("[%s] remote event: seek to %.1fs (latency=%dms)\n", role, rPos, latency)
+			applyMpv(mc, role, mpv.Cmd{Name: mpv.CmdSeek, Pos: m.PositionSeconds})
 		case syncmsg.TypeHeartbeat:
 			rPos = m.PositionSeconds
 			state := "paused"
@@ -264,10 +340,16 @@ func runPeer(ctx context.Context, conn net.Conn, role string, hub *cmdHub) {
 	fmt.Printf("[%s] stream closed by peer\n", role)
 }
 
-// peerCmd is one local playback command parsed from stdin.
+// peerCmd is one local playback command parsed from stdin or observed
+// from mpv.
 type peerCmd struct {
 	name string
-	pos  float64 // only for seek.
+	pos  float64 // Only for seek, or the authoritative mpv position below.
+	// fromMpv marks commands observed from mpv (as opposed to typed on
+	// stdin). Their pos is authoritative: a remote-applied move bypassed
+	// sendLoop, so the clock resyncs to it instead of advancing and
+	// drifting.
+	fromMpv bool
 }
 
 // cmdHub broadcasts stdin commands to every active peer's sendLoop. Delivery
@@ -388,23 +470,31 @@ func sendLoop(ctx context.Context, conn net.Conn, role string, cmds <-chan peerC
 				return
 			}
 		case c := <-cmds:
-			advance()
+			src := "local"
+			if c.fromMpv && c.name != "status" {
+				// mpv owns the truth here: resync the clock to the
+				// observed position instead of advancing a stale one.
+				pos, last = c.pos, time.Now()
+				src = "local(mpv)"
+			} else {
+				advance()
+			}
 			switch c.name {
 			case "play":
 				playing = true
-				fmt.Printf("[%s] local: play from %.1fs\n", role, pos)
+				fmt.Printf("[%s] %s: play from %.1fs\n", role, src, pos)
 				if !emit(syncmsg.TypePlay) {
 					return
 				}
 			case "pause":
 				playing = false
-				fmt.Printf("[%s] local: pause at %.1fs\n", role, pos)
+				fmt.Printf("[%s] %s: pause at %.1fs\n", role, src, pos)
 				if !emit(syncmsg.TypePause) {
 					return
 				}
 			case "seek":
 				pos = c.pos // playing/paused state preserved.
-				fmt.Printf("[%s] local: seek to %.1fs\n", role, pos)
+				fmt.Printf("[%s] %s: seek to %.1fs\n", role, src, pos)
 				if !emit(syncmsg.TypeSeek) {
 					return
 				}
